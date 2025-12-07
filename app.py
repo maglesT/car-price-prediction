@@ -4,6 +4,7 @@ import numpy as np
 import pickle
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy import stats
 
 # Only import SHAP if available (graceful degradation)
 try:
@@ -103,11 +104,122 @@ def create_predict_function(model_params):
     return predict_fn
 
 # ===========================
+# BIAS DETECTION FUNCTIONS
+# ===========================
+
+def analyze_bias(model_params, feature_names):
+    """
+    Analyze potential bias in model predictions across different feature segments
+    """
+    np.random.seed(42)
+    n_samples = 1000
+    
+    # Generate synthetic test data covering feature ranges
+    test_data = {
+        'wheelbase': np.random.uniform(86, 120, n_samples),
+        'carlength': np.random.uniform(141, 208, n_samples),
+        'carwidth': np.random.uniform(60, 72, n_samples),
+        'carheight': np.random.uniform(47, 60, n_samples),
+        'curbweight': np.random.uniform(1488, 4066, n_samples),
+        'enginesize': np.random.uniform(61, 326, n_samples),
+        'boreratio': np.random.uniform(2.54, 3.94, n_samples),
+        'horsepower': np.random.uniform(48, 288, n_samples),
+        'citympg': np.random.uniform(13, 49, n_samples),
+        'highwaympg': np.random.uniform(16, 54, n_samples),
+    }
+    
+    # Convert to array
+    X_test = np.column_stack([test_data[name] for name in feature_names])
+    
+    # Make predictions for all samples
+    predictions = []
+    for i in range(n_samples):
+        pred, _ = predict_price(X_test[i].tolist(), model_params)
+        predictions.append(pred)
+    
+    predictions = np.array(predictions)
+    
+    # Analyze bias across different segments
+    bias_analysis = {}
+    
+    # 1. Analyze by efficiency (MPG)
+    low_mpg = predictions[test_data['citympg'] < 20]
+    high_mpg = predictions[test_data['citympg'] >= 35]
+    
+    bias_analysis['efficiency'] = {
+        'low_mpg_mean': np.mean(low_mpg),
+        'high_mpg_mean': np.mean(high_mpg),
+        'difference': np.mean(low_mpg) - np.mean(high_mpg),
+        'low_mpg_std': np.std(low_mpg),
+        'high_mpg_std': np.std(high_mpg)
+    }
+    
+    # 2. Analyze by size (weight)
+    light_cars = predictions[test_data['curbweight'] < 2200]
+    heavy_cars = predictions[test_data['curbweight'] >= 3200]
+    
+    bias_analysis['size'] = {
+        'light_mean': np.mean(light_cars),
+        'heavy_mean': np.mean(heavy_cars),
+        'difference': np.mean(heavy_cars) - np.mean(light_cars),
+        'light_std': np.std(light_cars),
+        'heavy_std': np.std(heavy_cars)
+    }
+    
+    # 3. Analyze by power (horsepower)
+    low_power = predictions[test_data['horsepower'] < 90]
+    high_power = predictions[test_data['horsepower'] >= 180]
+    
+    bias_analysis['power'] = {
+        'low_power_mean': np.mean(low_power),
+        'high_power_mean': np.mean(high_power),
+        'difference': np.mean(high_power) - np.mean(low_power),
+        'low_power_std': np.std(low_power),
+        'high_power_std': np.std(high_power)
+    }
+    
+    # 4. Statistical fairness test (coefficient of variation)
+    cv = np.std(predictions) / np.mean(predictions)
+    bias_analysis['overall_fairness'] = {
+        'coefficient_variation': cv,
+        'mean_prediction': np.mean(predictions),
+        'std_prediction': np.std(predictions),
+        'min_prediction': np.min(predictions),
+        'max_prediction': np.max(predictions)
+    }
+    
+    return bias_analysis, test_data, predictions
+
+def detect_feature_bias(shap_values, feature_names, features):
+    """
+    Detect if certain features have disproportionate impact (potential bias)
+    """
+    impacts = np.abs(shap_values.values[0])
+    total_impact = np.sum(impacts)
+    
+    feature_bias = []
+    for i, (name, impact) in enumerate(zip(feature_names, impacts)):
+        contribution_pct = (impact / total_impact) * 100
+        
+        # Flag if single feature contributes >30% (potential over-reliance)
+        is_biased = contribution_pct > 30
+        
+        feature_bias.append({
+            'feature': name,
+            'contribution_pct': contribution_pct,
+            'absolute_impact': impact,
+            'potentially_biased': is_biased,
+            'your_value': features[i]
+        })
+    
+    return sorted(feature_bias, key=lambda x: x['contribution_pct'], reverse=True)
+
+# ===========================
 # UI - HEADER
 # ===========================
 
 st.title("🚗 Car Price Prediction with Explainable AI")
-st.markdown("**AI-Powered Price Estimation using Pure Mathematics + SHAP Explainability**")
+st.markdown("**AI-Powered Price Estimation using Pure Mathematics + SHAP Explainability + Fairness Analysis**")
 
 # Check if model loaded
 if error:
@@ -500,296 +612,11 @@ if st.button("🔮 Predict Car Price with Explanation", type="primary", use_cont
                         elif row['Impact ($)'] < 0:
                             st.markdown(f"- ✓ **{row['Feature'].replace('_', ' ')}** already reducing (-${abs(row['Impact ($)']):,.0f})")
                             count += 1
-        
-        else:
-            st.warning("⚠️ SHAP not available. Install with: `pip install shap`")
-        
-    except Exception as e:
-        st.error(f"❌ Prediction error: {str(e)}")
-        with st.expander("Error Details"):
-            st.code(str(e))
-            import traceback
-            st.code(traceback.format_exc())
-
-# ===========================
-# FOOTER - MODEL INFO
-# ===========================
-
-st.markdown("---")
-
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    st.markdown("""
-    ### 📊 About This Model
-    
-    **Algorithm**: Linear Regression via Normal Equation  
-    **Formula**: θ = (X^T X)^(-1) X^T y  
-    **Training Data**: 164 cars  
-    **Test Accuracy**: 78.3% (R² score)  
-    **Average Error**: $3,064  
-    **Explainability**: SHAP (SHapley Additive exPlanations)
-    
-    #### Why Normal Equation + SHAP?
-    - ✅ No ML libraries needed (only NumPy!)
-    - ✅ Direct mathematical solution
-    - ✅ Fast deployment (< 1 minute)
-    - ✅ Complete transparency with SHAP
-    - ✅ Perfect for linear regression
-    - ✅ Real-time explainability
-    
-    #### Model Selection Process
-    We tested both linear and polynomial (degree 2) features:
-    - Linear model: 78% test accuracy with minimal overfitting
-    - Polynomial model: Showed 71% overfitting gap
-    - **Decision**: Linear model generalizes better for our dataset size
-    
-    #### Explainable AI Integration
-    - **SHAP values**: Show feature contributions to each prediction
-    - **Waterfall plots**: Visual breakdown of prediction logic
-    - **Feature importance**: Understand what drives prices
-    - **Bias detection**: Monitor fairness in predictions
-    """)
-
-with col2:
-    st.markdown("""
-    ### 🎓 Project Info
-    
-    **Created by**:  
-    Ruben Santosh  
-    Vignesh R Nair  
-    Arko Chakraborty  
-    
-    **University**:  
-    Dayananda Sagar University  
-    
-    **Department**:  
-    CSE (AI & ML)  
-    
-    **Year**: 2025  
-    
-    **Tech Stack**:
-    - Streamlit
-    - NumPy
-    - SHAP (XAI)
-    - Pure Mathematics
-    - GitHub
-    
-    **Dataset**:  
-    Car Price Dataset  
-    (205 cars, 10 features)
-    
-    **MLOps**:
-    - Explainable AI
-    - Real-time monitoring
-    - Bias detection
-    - GitHub CI/CD
-    """)
-
-# Mathematical explanation (expandable)
-with st.expander("🔬 See the Mathematics Behind Predictions"):
-    st.markdown("""
-    ### Normal Equation Formula
-    
-    The model finds optimal parameters θ directly:
-    
-    $$\\theta = (X^T X)^{-1} X^T y$$
-    
-    Where:
-    - **θ (theta)** = model parameters (weights)
-    - **X** = feature matrix (car specifications)
-    - **y** = target values (prices)
-    - **X^T** = transpose of X
-    
-    ### Prediction Formula
-    
-    For a new car, we calculate:
-    
-    $$\\hat{y} = \\theta_0 + \\theta_1 x_1 + \\theta_2 x_2 + ... + \\theta_{10} x_{10}$$
-    
-    ### Feature Scaling
-    
-    Before prediction, we standardize features:
-    
-    $$x_{scaled} = \\frac{x - \\mu}{\\sigma}$$
-    
-    Where:
-    - **μ** = mean of feature
-    - **σ** = standard deviation
-    
-    This ensures all features contribute equally to the prediction.
-    
-    ### SHAP Values Explained
-    
-    SHAP uses Shapley values from game theory:
-    
-    $$\\phi_i = \\sum_{S \\subseteq F \\setminus \\{i\\}} \\frac{|S|!(|F|-|S|-1)!}{|F|!}[f_{S \\cup \\{i\\}}(x_{S \\cup \\{i\\}}) - f_S(x_S)]$$
-    
-    Where:
-    - **φᵢ** = SHAP value for feature i
-    - **F** = set of all features
-    - **S** = subset of features
-    
-    SHAP values represent each feature's contribution to moving the prediction from the base value to the final prediction.
-    
-    ### Example Calculation
-    
-    For your car with enginesize = 126 cc:
-    1. Scale: (126 - 128.5) / 41.2 = -0.061
-    2. Multiply by weight: -0.061 × 2981.57 = -181.88
-    3. SHAP shows this feature's isolated contribution
-    4. Sum all weighted features + intercept = Final Price
-    """)
-
-# Usage tips
-with st.expander("💡 Tips for Best Results"):
-    st.markdown("""
-    ### Getting Accurate Predictions
-    
-    1. **Use Realistic Values**
-       - Don't extrapolate beyond slider ranges
-       - These represent typical car specifications
-    
-    2. **Consider Correlations**
-       - Larger engines usually mean higher weight
-       - More horsepower often reduces MPG
-       - Bigger cars typically have longer wheelbases
-    
-    3. **Understand the Range**
-       - ±10% confidence interval is normal
-       - Real car prices vary by condition, location, features
-    
-    4. **Model Limitations**
-       - Based on 205 cars from dataset
-       - Doesn't account for: brand reputation, condition, mileage
-       - Best for comparative pricing
-    
-    5. **Using SHAP Explanations**
-       - Red features increase price relative to average
-       - Blue features decrease price relative to average
-       - Focus on high-impact features for biggest price changes
-       - Use "What-If" suggestions to optimize for your budget
-    """)
-# Add this after your existing imports
-from scipy import stats
-
-# ===========================
-# BIAS DETECTION FUNCTIONS
-# ===========================
-
-def analyze_bias(model_params, feature_names):
-    """
-    Analyze potential bias in model predictions across different feature segments
-    """
-    np.random.seed(42)
-    n_samples = 1000
-    
-    # Generate synthetic test data covering feature ranges
-    test_data = {
-        'wheelbase': np.random.uniform(86, 120, n_samples),
-        'carlength': np.random.uniform(141, 208, n_samples),
-        'carwidth': np.random.uniform(60, 72, n_samples),
-        'carheight': np.random.uniform(47, 60, n_samples),
-        'curbweight': np.random.uniform(1488, 4066, n_samples),
-        'enginesize': np.random.uniform(61, 326, n_samples),
-        'boreratio': np.random.uniform(2.54, 3.94, n_samples),
-        'horsepower': np.random.uniform(48, 288, n_samples),
-        'citympg': np.random.uniform(13, 49, n_samples),
-        'highwaympg': np.random.uniform(16, 54, n_samples),
-    }
-    
-    # Convert to array
-    X_test = np.column_stack([test_data[name] for name in feature_names])
-    
-    # Make predictions for all samples
-    predictions = []
-    for i in range(n_samples):
-        pred, _ = predict_price(X_test[i].tolist(), model_params)
-        predictions.append(pred)
-    
-    predictions = np.array(predictions)
-    
-    # Analyze bias across different segments
-    bias_analysis = {}
-    
-    # 1. Analyze by efficiency (MPG)
-    low_mpg = predictions[test_data['citympg'] < 20]
-    high_mpg = predictions[test_data['citympg'] >= 35]
-    
-    bias_analysis['efficiency'] = {
-        'low_mpg_mean': np.mean(low_mpg),
-        'high_mpg_mean': np.mean(high_mpg),
-        'difference': np.mean(low_mpg) - np.mean(high_mpg),
-        'low_mpg_std': np.std(low_mpg),
-        'high_mpg_std': np.std(high_mpg)
-    }
-    
-    # 2. Analyze by size (weight)
-    light_cars = predictions[test_data['curbweight'] < 2200]
-    heavy_cars = predictions[test_data['curbweight'] >= 3200]
-    
-    bias_analysis['size'] = {
-        'light_mean': np.mean(light_cars),
-        'heavy_mean': np.mean(heavy_cars),
-        'difference': np.mean(heavy_cars) - np.mean(light_cars),
-        'light_std': np.std(light_cars),
-        'heavy_std': np.std(heavy_cars)
-    }
-    
-    # 3. Analyze by power (horsepower)
-    low_power = predictions[test_data['horsepower'] < 90]
-    high_power = predictions[test_data['horsepower'] >= 180]
-    
-    bias_analysis['power'] = {
-        'low_power_mean': np.mean(low_power),
-        'high_power_mean': np.mean(high_power),
-        'difference': np.mean(high_power) - np.mean(low_power),
-        'low_power_std': np.std(low_power),
-        'high_power_std': np.std(high_power)
-    }
-    
-    # 4. Statistical fairness test (coefficient of variation)
-    cv = np.std(predictions) / np.mean(predictions)
-    bias_analysis['overall_fairness'] = {
-        'coefficient_variation': cv,
-        'mean_prediction': np.mean(predictions),
-        'std_prediction': np.std(predictions),
-        'min_prediction': np.min(predictions),
-        'max_prediction': np.max(predictions)
-    }
-    
-    return bias_analysis, test_data, predictions
-
-def detect_feature_bias(shap_values, feature_names, features):
-    """
-    Detect if certain features have disproportionate impact (potential bias)
-    """
-    impacts = np.abs(shap_values.values[0])
-    total_impact = np.sum(impacts)
-    
-    feature_bias = []
-    for i, (name, impact) in enumerate(zip(feature_names, impacts)):
-        contribution_pct = (impact / total_impact) * 100
-        
-        # Flag if single feature contributes >30% (potential over-reliance)
-        is_biased = contribution_pct > 30
-        
-        feature_bias.append({
-            'feature': name,
-            'contribution_pct': contribution_pct,
-            'absolute_impact': impact,
-            'potentially_biased': is_biased,
-            'your_value': features[i]
-        })
-    
-    return sorted(feature_bias, key=lambda x: x['contribution_pct'], reverse=True)
-
-
-# ===========================
-# ADD THIS AFTER THE EXISTING SHAP SECTIONS (after tab3)
-# ===========================
-
-                # New tabs for fairness and bias
+                
+                # ===========================
+                # FAIRNESS & BIAS ANALYSIS
+                # ===========================
+                
                 st.markdown("---")
                 st.markdown("## ⚖️ Fairness & Bias Analysis")
                 st.markdown("**Ensuring transparent and equitable predictions**")
@@ -1075,7 +902,198 @@ def detect_feature_bias(shap_values, feature_names, features):
                         - Consider feature engineering to reduce single-feature dominance
                         - Implement regular fairness audits
                         """)
- 
+        
+        else:
+            st.warning("⚠️ SHAP not available. Install with: `pip install shap`")
+        
+    except Exception as e:
+        st.error(f"❌ Prediction error: {str(e)}")
+        with st.expander("Error Details"):
+            st.code(str(e))
+            import traceback
+            st.code(traceback.format_exc())
+
+# ===========================
+# FOOTER - MODEL INFO
+# ===========================
 
 st.markdown("---")
-st.caption("🚗 Car Price Predictor with Explainable AI | Built with ❤️ using Pure Math + SHAP | No ML Libraries Required!")
+
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.markdown("""
+    ### 📊 About This Model
+    
+    **Algorithm**: Linear Regression via Normal Equation  
+    **Formula**: θ = (X^T X)^(-1) X^T y  
+    **Training Data**: 164 cars  
+    **Test Accuracy**: 78.3% (R² score)  
+    **Average Error**: $3,064  
+    **Explainability**: SHAP (SHapley Additive exPlanations)  
+    **Fairness**: Bias detection & segment analysis
+    
+    #### Why Normal Equation + SHAP + Fairness?
+    - ✅ No ML libraries needed (only NumPy!)
+    - ✅ Direct mathematical solution
+    - ✅ Fast deployment (< 1 minute)
+    - ✅ Complete transparency with SHAP
+    - ✅ Perfect for linear regression
+    - ✅ Real-time explainability
+    - ✅ Fairness monitoring built-in
+    
+    #### Model Selection Process
+    We tested both linear and polynomial (degree 2) features:
+    - Linear model: 78% test accuracy with minimal overfitting
+    - Polynomial model: Showed 71% overfitting gap
+    - **Decision**: Linear model generalizes better for our dataset size
+    
+    #### Explainable AI Integration
+    - **SHAP values**: Show feature contributions to each prediction
+    - **Waterfall plots**: Visual breakdown of prediction logic
+    - **Feature importance**: Understand what drives prices
+    - **Bias detection**: Monitor fairness in predictions
+    - **Segment analysis**: Ensure equitable treatment across car types
+    """)
+
+with col2:
+    st.markdown("""
+    ### 🎓 Project Info
+    
+    **Created by**:  
+    Ruben Santosh  
+    Vignesh R Nair  
+    Arko Chakraborty  
+    
+    **University**:  
+    Dayananda Sagar University  
+    
+    **Department**:  
+    CSE (AI & ML)  
+    
+    **Year**: 2025  
+    
+    **Tech Stack**:
+    - Streamlit
+    - NumPy
+    - SHAP (XAI)
+    - Pure Mathematics
+    - GitHub
+    - Fairness Analysis
+    
+    **Dataset**:  
+    Car Price Dataset  
+    (205 cars, 10 features)
+    
+    **MLOps**:
+    - Explainable AI
+    - Real-time monitoring
+    - Bias detection
+    - Fairness analysis
+    - GitHub CI/CD
+    """)
+
+# Mathematical explanation (expandable)
+with st.expander("🔬 See the Mathematics Behind Predictions"):
+    st.markdown("""
+    ### Normal Equation Formula
+    
+    The model finds optimal parameters θ directly:
+    
+    $$\\theta = (X^T X)^{-1} X^T y$$
+    
+    Where:
+    - **θ (theta)** = model parameters (weights)
+    - **X** = feature matrix (car specifications)
+    - **y** = target values (prices)
+    - **X^T** = transpose of X
+    
+    ### Prediction Formula
+    
+    For a new car, we calculate:
+    
+    $$\\hat{y} = \\theta_0 + \\theta_1 x_1 + \\theta_2 x_2 + ... + \\theta_{10} x_{10}$$
+    
+    ### Feature Scaling
+    
+    Before prediction, we standardize features:
+    
+    $$x_{scaled} = \\frac{x - \\mu}{\\sigma}$$
+    
+    Where:
+    - **μ** = mean of feature
+    - **σ** = standard deviation
+    
+    This ensures all features contribute equally to the prediction.
+    
+    ### SHAP Values Explained
+    
+    SHAP uses Shapley values from game theory:
+    
+    $$\\phi_i = \\sum_{S \\subseteq F \\setminus \\{i\\}} \\frac{|S|!(|F|-|S|-1)!}{|F|!}[f_{S \\cup \\{i\\}}(x_{S \\cup \\{i\\}}) - f_S(x_S)]$$
+    
+    Where:
+    - **φᵢ** = SHAP value for feature i
+    - **F** = set of all features
+    - **S** = subset of features
+    
+    SHAP values represent each feature's contribution to moving the prediction from the base value to the final prediction.
+    
+    ### Fairness Metrics
+    
+    **Coefficient of Variation (CV)**:
+    
+    $$CV = \\frac{\\sigma}{\\mu}$$
+    
+    Where:
+    - **σ** = standard deviation of predictions
+    - **μ** = mean of predictions
+    
+    Lower CV indicates more consistent and fair predictions across different inputs.
+    
+    ### Example Calculation
+    
+    For your car with enginesize = 126 cc:
+    1. Scale: (126 - 128.5) / 41.2 = -0.061
+    2. Multiply by weight: -0.061 × 2981.57 = -181.88
+    3. SHAP shows this feature's isolated contribution
+    4. Sum all weighted features + intercept = Final Price
+    """)
+
+# Usage tips
+with st.expander("💡 Tips for Best Results"):
+    st.markdown("""
+    ### Getting Accurate Predictions
+    
+    1. **Use Realistic Values**
+       - Don't extrapolate beyond slider ranges
+       - These represent typical car specifications
+    
+    2. **Consider Correlations**
+       - Larger engines usually mean higher weight
+       - More horsepower often reduces MPG
+       - Bigger cars typically have longer wheelbases
+    
+    3. **Understand the Range**
+       - ±10% confidence interval is normal
+       - Real car prices vary by condition, location, features
+    
+    4. **Model Limitations**
+       - Based on 205 cars from dataset
+       - Doesn't account for: brand reputation, condition, mileage
+       - Best for comparative pricing
+    
+    5. **Using SHAP Explanations**
+       - Red features increase price relative to average
+       - Blue features decrease price relative to average
+       - Focus on high-impact features for biggest price changes
+       - Use "What-If" suggestions to optimize for your budget
+    
+    6. **Understanding Fairness**
+       - Check feature bias - no single feature should dominate
+       - Review segment fairness for consistency
+       - High fairness score = reliable predictions across all car types
+    """)
+
+st.markdown("---")
+st.caption("🚗 Car Price Predictor with Explainable AI & Fairness Analysis | Built with ❤️ using Pure Math + SHAP | Responsible AI in Production!")
